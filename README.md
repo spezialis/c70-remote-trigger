@@ -14,7 +14,7 @@ A single Python script runs on the Motive PC. It listens for Motive's remote-tri
 ## Requirements
 
 - Python 3.10+ and `requests` (`pip install requests`)
-- Canon EOS C70 on the network through a USB-C Ethernet adapter with an RTL8153-class chip. We tested the LMP USB-C to Gigabit Ethernet adapter; Canon also lists the [TP-Link UE300](https://www.tp-link.com/us/home-networking/usb-converter/ue300/) and the [StarTech US1GC30W](https://www.startech.com/en-us/networking-io/US1GC30W). 2.5/5 GbE adapters do **not** work, e.g. the [Delock 81570](https://www.delock.com/produkt/81570/merkmale.html) (RTL8157).
+- Canon EOS C70 on the network through a USB-C Ethernet adapter with an RTL8153-class chip. We tested the [LMP USB-C to Gigabit Ethernet adapter](https://lmp-adapter.com/product/lmp-usb-c-to-gigabit-ethernet-adapter/); Canon also lists the [TP-Link UE300](https://www.tp-link.com/us/home-networking/usb-converter/ue300/) and the [StarTech US1GC30W](https://www.startech.com/en-us/networking-io/US1GC30W). 2.5/5 GbE adapters do **not** work, e.g. the [Delock 81570](https://www.delock.com/produkt/81570/merkmale.html) (RTL8157).
 - Motive with **Settings → Streaming → Remote Trigger** turned on (XML broadcast port 1512)
 - The Motive PC's firewall must allow inbound UDP on port 1512 for Python
 

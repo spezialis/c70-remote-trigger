@@ -10,8 +10,8 @@ Setup, usage, take-log columns and the verified API are in [README.md](README.md
 - Canon manual: `CAC70RF.pdf` (local only, gitignored). Browser Remote: pp. 156–162; metadata: p. 98.
 
 ## Environment (verified on device)
-- C70 firmware **1.1.4.1** (all facts here were verified on it). Network uses an LMP USB-C Gigabit Ethernet adapter. The [Delock 81570](https://www.delock.com/produkt/81570/merkmale.html) (RTL8157, 5 GbE) did **not** work; the C70 only supports RTL8153-class chips.
-- Camera connection SET2 = Browser Remote, Ethernet, IPv4 DHCP, IPv6 off (SET1 = XC Protocol, unused). Currently on the school network at **10.21.137.42** (/21, gw 10.21.136.1), which may change.
+- C70 firmware **1.1.4.1** (all facts here were verified on it). Network uses an [LMP USB-C Gigabit Ethernet](https://lmp-adapter.com/product/lmp-usb-c-to-gigabit-ethernet-adapter/) adapter. The [Delock 81570](https://www.delock.com/produkt/81570/merkmale.html) (RTL8157, 5 GbE) did **not** work; the C70 only supports RTL8153-class chips.
+- Camera connection SET2 = Browser Remote, Ethernet, IPv4 DHCP, IPv6 off (SET1 = [XC Protocol](https://www.youtube.com/watch?v=7Emc3WyHPDY), unused). Currently on the school network at **10.21.137.42** (/21, gw 10.21.136.1), which may change.
 - Browser Remote user: One User (Full), `ias`. **Never store the password**; ask the user.
 - One session per user: login redirects to `/wpd/already_login.shtml` while another session is alive, and a stale session expires after ~45–60 s. While the bridge runs, Browser Remote as `ias` is blocked in a browser.
 - Motive: Remote Trigger on, XML broadcast port 1512. Motive binds `10.21.136.113:1512` itself; the bridge on `0.0.0.0:1512` (SO_REUSEADDR) still receives the packets.
