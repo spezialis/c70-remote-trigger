@@ -45,15 +45,32 @@ python c70_motive_bridge.py                # bridge; Ctrl+C logs out
 ```
 The bridge logs in at startup, sends a keepalive every 15 s, logs in again on 401/403, and confirms the REC state after each press.
 
+### Take log (added 2026-11-19, tested against a fake camera only)
+Each start/stop is appended to `takes.csv` (override with `$env:C70_LOG`):
+`host_time, event, take, motive_timecode, motive_packet_id, motive_from, post_http, post_ms, state, confirmed, confirm_ms`.
+`post_ms`/`confirm_ms` are measured from the moment the Motive packet was received.
+The Motive XML is parsed generically (`<Tag VALUE="..."/>` children). The field names `Name`, `TimeCode` and `PacketID` come from OptiTrack docs and are **not yet verified** on this Motive install. The bridge prints the raw XML of every trigger, so check it on the first real take. Non-XML packets fall back to substring matching, as before.
+
+### Endpoint discovery (read-only)
+```powershell
+python c70_motive_bridge.py --discover      # crawls /wpd/shoot.shtml + linked pages/scripts (GET only, skips logout)
+python c70_motive_bridge.py --get /ccapi    # any single read-only GET with the session
+```
+`--discover` saves the camera's web UI files to `discover/` and writes `discover/endpoints.txt` (API paths + `get_/post_/put_` wrapper names).
+
 ## Remaining to-dos
+0. **Run `--discover` on the camera** (log in as Full user `ias`), then wire up the features the manual (CAC70RF.pdf pp. 98, 156–162) says Browser Remote supports. None of their endpoints are known yet:
+   - clip title = Motive take name via the user memo, "Apply from Next" (XF-AVC only; the camera needs Metadata Setting = Remote / [Activate])
+   - shot mark at take start; OK/NG mark on the last clip
+   - pre-take check: remaining card time, battery, camera timecode (log it next to the Motive TC)
 1. Production network: **fixed IP** on a direct cable or a dedicated switch (e.g. camera 192.168.1.10/24, PC NIC 192.168.1.20/24), NOT on the OptiTrack NIC. Camera is on school DHCP right now (10.21.137.42); set `C70_IP` accordingly.
-2. Sync: test take `video_test/Take 2026-11-17 08.02.59 PM`: mocap 523 frames @120 fps (4.358 s) vs video 240 frames @50p (4.800 s). Start offset not measured (needs a visible sync event). A hardware Motive/camera sync device is under consideration for later.
+2. Sync: **since 2026-11-19 the C70 and Motive share timecode from an external timecode device**, so align in post by timecode, not by trigger timing. Still to verify: that the C70 clip TC and Motive's take TC (and the `TimeCode` field in Motive's XML / `takes.csv`) match on a real take, e.g. with a clap or slate. Earlier test take `video_test/Take 2026-11-17 08.02.59 PM` (before shared TC): mocap 523 frames @120 fps (4.358 s) vs video 240 frames @50p (4.800 s).
 3. Optional: autostart the bridge (e.g. Task Scheduler) and store the password outside the shell history.
 
 ## Known limitations / design notes
 - Network trigger latency is roughly tens to hundreds of ms and not deterministic. For frame-accurate alignment, feed **shared SMPTE timecode** into the OptiTrack **eSync 2** and the C70 **BNC TC input**, and align in post.
 - C70 has a single USB-C port, so the Ethernet adapter and a DJI gimbal control cable can't be used at the same time.
-- Possible improvements: use the take name from Motive's XML in the log; retry the POST if the state isn't confirmed.
+- Possible improvement: retry the POST if the state isn't confirmed.
 
 ## User preferences
 Direct, concise, honest about uncertainty; flag assumptions; don't invent API details. Verify against the real device.

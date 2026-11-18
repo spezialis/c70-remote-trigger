@@ -13,15 +13,27 @@ Test the camera link first, without Motive:
 
 Run the bridge:
     python c70_motive_bridge.py
+
+Each start/stop is appended to a CSV log (C70_LOG, default takes.csv next to
+this script) with the Motive take name/timecode and host-side timings.
+
+Find more camera endpoints (read-only; saves the camera's web UI scripts):
+    python c70_motive_bridge.py --discover
+    python c70_motive_bridge.py --get /ccapi
 """
 
 import argparse
-import json
+import csv
+import datetime as dt
 import os
 import atexit
+import re
 import socket
 import threading
 import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.auth import HTTPDigestAuth
@@ -39,6 +51,9 @@ STOP_BODY = {"action": "stop"}
 MOTIVE_PORT = 1512                 # Motive Command Port + 2
 DEBOUNCE_S = 0.5                   # ignore duplicate packets within this window
 KEEPALIVE_S = 15                   # session seems to expire after ~45-60 s idle
+HERE = Path(__file__).resolve().parent
+LOG_PATH = Path(os.environ.get("C70_LOG", HERE / "takes.csv"))
+DISCOVER_DIR = HERE / "discover"
 # -------------------------------------------------------------------------
 
 BASE = f"http://{CAMERA_IP}"
@@ -117,12 +132,20 @@ def rec_status() -> str | None:
         return None
 
 
-def press_rec(body: dict) -> bool:
-    t0 = time.perf_counter()
+def press_rec(body: dict, t0: float | None = None) -> dict:
+    """Press REC and wait for the state readback.
+
+    t0 (perf_counter) is when the trigger arrived; all ms values are relative
+    to it, so they include any time spent before the POST was sent.
+    """
+    t0 = time.perf_counter() if t0 is None else t0
+    res = {"post_http": "", "post_ms": "", "state": "", "confirmed": False, "confirm_ms": ""}
     r = _request("POST", body)
     if r is None:
-        return False
+        res["post_http"] = "error"
+        return res
     ms = (time.perf_counter() - t0) * 1000
+    res.update(post_http=r.status_code, post_ms=f"{ms:.0f}")
     print(f"[camera] {body} -> HTTP {r.status_code} ({ms:.0f} ms) {r.text.strip()[:200]}")
     if r.ok:
         # Verified: status reads "start"/"stop"; the stop transition can take >0.3 s.
@@ -134,15 +157,129 @@ def press_rec(body: dict) -> bool:
                 break
             time.sleep(0.2)
         ms = (time.perf_counter() - t0) * 1000
-        tag = "CONFIRMED" if state == want else "NOT CONFIRMED"
-        print(f"[camera] state {state!r} {tag} after {ms:.0f} ms")
-    return r.ok
+        ok = state == want
+        res.update(state=state or "", confirmed=ok, confirm_ms=f"{ms:.0f}")
+        print(f"[camera] state {state!r} {'CONFIRMED' if ok else 'NOT CONFIRMED'} after {ms:.0f} ms")
+    return res
+
+
+# ------------------------------------------------------------ Motive packets
+def parse_motive(msg: str) -> tuple[str, dict] | None:
+    """Return (root tag, {child tag: VALUE attr}) for Motive's XML broadcast.
+
+    Field names (Name, TimeCode, ...) follow OptiTrack's documentation and are
+    not yet verified on this Motive install; the raw XML is printed so they can
+    be checked. Falls back to substring matching if the XML doesn't parse.
+    """
+    try:
+        root = ET.fromstring(msg.strip().lstrip("﻿"))
+    except ET.ParseError:
+        for tag in ("CaptureStart", "CaptureStop"):
+            if tag in msg:
+                return tag, {}
+        return None
+    fields = {child.tag: child.get("VALUE", (child.text or "").strip()) for child in root}
+    return root.tag, fields
+
+
+LOG_FIELDS = ["host_time", "event", "take", "motive_timecode", "motive_packet_id",
+              "motive_from", "post_http", "post_ms", "state", "confirmed", "confirm_ms"]
+
+
+def log_take(row: dict) -> None:
+    new = not LOG_PATH.exists()
+    try:
+        with LOG_PATH.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow(row)
+    except OSError as e:
+        print(f"[log] could not write {LOG_PATH}: {e}")
 
 
 def status() -> None:
     r = _request("GET")
     if r is not None:
         print(f"[camera] GET recbutton -> HTTP {r.status_code} {r.text.strip()[:300]}")
+
+
+def get_path(path: str) -> None:
+    """Read-only GET of any camera path with the session (for probing endpoints)."""
+    url = urljoin(BASE + "/", path.lstrip("/"))
+    if "logout" in url:
+        print("refusing to GET a logout URL")
+        return
+    try:
+        r = session.get(url, timeout=3, allow_redirects=False)
+    except requests.RequestException as e:
+        print(f"[camera] GET {url} failed: {e}")
+        return
+    print(f"[camera] GET {url} -> HTTP {r.status_code} {r.headers.get('Location', '')}")
+    print(r.text[:3000])
+
+
+# Strings in the web UI that look like API paths / API wrapper functions.
+ENDPOINT_RE = re.compile(r"(?:ccapi|brapi)/[A-Za-z0-9_/.{}$+-]*")
+FUNC_RE = re.compile(r"\b(?:get|post|put|delete)_[A-Za-z0-9_]{3,}\b")
+LINK_RE = re.compile(r"""["']([^"'\s<>]+\.(?:js|shtml|html?))(?:\?[^"']*)?["']""")
+
+
+def discover(max_files: int = 60) -> None:
+    """Crawl the Browser Remote web UI (GET only) and list the API paths it uses.
+
+    Saves every page/script under ./discover/ so the request bodies can be read
+    from the source, the same way recbutton was found in shoot_script.js.
+    """
+    if not login():
+        return
+    host = urlparse(BASE).netloc
+    queue, seen = ["/wpd/shoot.shtml"], set()
+    endpoints: dict[str, set[str]] = {}
+    funcs: dict[str, set[str]] = {}
+    DISCOVER_DIR.mkdir(exist_ok=True)
+    while queue and len(seen) < max_files:
+        path = queue.pop(0)
+        if path in seen or "logout" in path:
+            continue
+        seen.add(path)
+        try:
+            r = session.get(BASE + path, timeout=3, allow_redirects=False)
+        except requests.RequestException as e:
+            print(f"  {path}: {e}")
+            continue
+        print(f"  GET {path} -> {r.status_code} ({len(r.content)} bytes)")
+        if not r.ok:
+            continue
+        out = DISCOVER_DIR / path.lstrip("/")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(r.content)
+        text = r.text
+        for m in ENDPOINT_RE.findall(text):
+            endpoints.setdefault(m.rstrip("/."), set()).add(path)
+        for m in FUNC_RE.findall(text):
+            funcs.setdefault(m, set()).add(path)
+        for link in LINK_RE.findall(text):
+            u = urlparse(urljoin(BASE + path, link))
+            if u.netloc == host and u.path not in seen:
+                queue.append(u.path)
+
+    # Standard CCAPI exposes its endpoint list at GET /ccapi; may not exist on the C70.
+    try:
+        r = session.get(BASE + "/ccapi", timeout=3, allow_redirects=False)
+        (DISCOVER_DIR / "ccapi_root.txt").write_text(f"HTTP {r.status_code}\n{r.text}", encoding="utf-8")
+        print(f"  GET /ccapi -> {r.status_code}")
+    except requests.RequestException as e:
+        print(f"  GET /ccapi: {e}")
+
+    lines = ["# API paths found in the web UI (path  <- files)"]
+    lines += [f"{k}  <- {', '.join(sorted(v))}" for k, v in sorted(endpoints.items())]
+    lines += ["", "# API wrapper functions (name  <- files)"]
+    lines += [f"{k}  <- {', '.join(sorted(v))}" for k, v in sorted(funcs.items())]
+    summary = DISCOVER_DIR / "endpoints.txt"
+    summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    print(f"\nSaved {len(seen)} files + summary to {DISCOVER_DIR}")
 
 
 def keepalive() -> None:
@@ -157,35 +294,61 @@ def listen():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("", MOTIVE_PORT))
     print(f"Listening for Motive triggers on UDP {MOTIVE_PORT} -> {URL}")
+    print(f"Logging takes to {LOG_PATH}")
     login()
     print(f"[camera] state: {rec_status()}")
     threading.Thread(target=keepalive, daemon=True).start()
 
     last = {"start": 0.0, "stop": 0.0}
+    current_take = ""
     while True:
         data, addr = sock.recvfrom(65535)
+        t_rx = time.perf_counter()
+        host_time = dt.datetime.now().isoformat(timespec="milliseconds")
         msg = data.decode("utf-8", errors="ignore")
-        now = time.monotonic()
-        if "CaptureStart" in msg:
+        parsed = parse_motive(msg)
+        if parsed is None:
+            continue
+        tag, fields = parsed
+        if tag == "CaptureStart":
             kind, body = "start", START_BODY
-        elif "CaptureStop" in msg:
+        elif tag == "CaptureStop":
             kind, body = "stop", STOP_BODY
         else:
             continue
+        now = time.monotonic()
         if now - last[kind] < DEBOUNCE_S:
             continue
         last[kind] = now
-        print(f"[motive] {kind} from {addr[0]}")
-        press_rec(body)
+
+        take = fields.get("Name", "")
+        if kind == "start":
+            current_take = take
+        take = take or current_take  # in case CaptureStop has no name
+        tc = fields.get("TimeCode", "")
+        print(f"[motive] {kind} take={take!r} tc={tc!r} from {addr[0]}")
+        print(f"[motive] raw: {msg.strip()[:500]}")
+        res = press_rec(body, t_rx)
+        log_take({"host_time": host_time, "event": kind, "take": take,
+                  "motive_timecode": tc, "motive_packet_id": fields.get("PacketID", ""),
+                  "motive_from": addr[0], **res})
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--test", choices=["start", "stop"], help="send one command and exit")
     p.add_argument("--status", action="store_true", help="login + GET recbutton (read-only)")
+    p.add_argument("--discover", action="store_true",
+                   help="crawl the Browser Remote UI (GET only), list API paths, save to ./discover")
+    p.add_argument("--get", metavar="PATH", help="login + read-only GET of PATH, e.g. /ccapi")
     a = p.parse_args()
     atexit.register(logout)  # free the single camera session (also on Ctrl+C)
-    if a.status:
+    if a.discover:
+        discover()
+    elif a.get:
+        if login():
+            get_path(a.get)
+    elif a.status:
         login()
         status()
     elif a.test:
