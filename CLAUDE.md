@@ -10,7 +10,7 @@ Setup, usage, take-log columns and the verified API are in [README.md](README.md
 - Canon manual: `CAC70RF.pdf` (local only, gitignored). Browser Remote: pp. 156–162; metadata: p. 98.
 
 ## Environment (verified on device)
-- C70 firmware 1.1.2.1. Network uses an LMP USB-C Gigabit Ethernet adapter. The Delock 81570 (RTL8157, 5 GbE) did **not** work; the C70 only supports RTL8153-class chips.
+- C70 firmware **1.1.4.1** (all facts here were verified on it). Network uses an LMP USB-C Gigabit Ethernet adapter. The [Delock 81570](https://www.delock.com/produkt/81570/merkmale.html) (RTL8157, 5 GbE) did **not** work; the C70 only supports RTL8153-class chips.
 - Camera connection SET2 = Browser Remote, Ethernet, IPv4 DHCP, IPv6 off (SET1 = XC Protocol, unused). Currently on the school network at **10.21.137.42** (/21, gw 10.21.136.1), which may change.
 - Browser Remote user: One User (Full), `ias`. **Never store the password**; ask the user.
 - One session per user: login redirects to `/wpd/already_login.shtml` while another session is alive, and a stale session expires after ~45–60 s. While the bridge runs, Browser Remote as `ias` is blocked in a browser.
@@ -19,7 +19,7 @@ Setup, usage, take-log columns and the verified API are in [README.md](README.md
 - **Timecode (since 2026-11-19):** the C70 (BNC TC in) and Motive (eSync 2) are fed shared SMPTE timecode from an external device. Align footage by TC; the network trigger is not frame-accurate.
 
 ## Status
-- REC start/stop: **works end to end** (2026-11-17). HTTP ~8 ms; camera reports `start` ~220 ms and `stop` ~1050 ms after the trigger.
+- REC start/stop: **works end to end** (2026-11-17, firmware 1.1.4.1). HTTP ~8 ms; camera reports `start` ~220 ms and `stop` ~1050 ms after the trigger.
 - Take log (`takes.csv`) and `--discover` / `--get`: added 2026-11-19, **tested only against a fake camera**. The Motive XML field names `Name`, `TimeCode` and `PacketID` come from OptiTrack docs and are not yet verified on this Motive install. The bridge prints the raw XML so it can be checked.
 
 ## Open to-dos
