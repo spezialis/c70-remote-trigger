@@ -1,4 +1,4 @@
-# RemoteTrigger_c70
+# Cannon C70 Remote Trigger
 
 Starts and stops recording on a **Canon EOS C70** when a take starts or stops in **OptiTrack Motive**.
 
