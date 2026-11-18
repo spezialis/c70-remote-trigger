@@ -103,4 +103,4 @@ python c70_motive_bridge.py --get /ccapi   # read-only GET of any single camera 
 - The C70 has a single USB-C port, so the Ethernet adapter and a gimbal control cable can't be connected at the same time.
 - Put the camera on a fixed IP on a dedicated network (direct cable or its own switch), not on the OptiTrack camera network.
 
-See [HANDOFF.md](HANDOFF.md) for the detailed project log and open to-dos.
+See [CLAUDE.md](CLAUDE.md) for environment details, project status and open to-dos.
