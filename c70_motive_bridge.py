@@ -52,7 +52,10 @@ MOTIVE_PORT = int(os.environ.get("C70_MOTIVE_PORT", "1512"))  # Motive Command P
 DEBOUNCE_S = 0.5                   # ignore duplicate packets within this window
 KEEPALIVE_S = 15                   # session seems to expire after ~45-60 s idle
 HERE = Path(__file__).resolve().parent
-LOG_PATH = Path(os.environ.get("C70_LOG", HERE / "takes.csv"))
+# Take log: one file per Motive session (takes_<SessionName>.csv next to this script),
+# or a fixed file if C70_LOG is set.
+LOG_FIXED = os.environ.get("C70_LOG")
+LOG_PATH = Path(LOG_FIXED) if LOG_FIXED else HERE / "takes.csv"   # used until a session name is known
 MOTIVE_RAW_LOG = HERE / "motive_packets.log"   # every raw UDP packet from Motive
 DISCOVER_DIR = HERE / "discover"
 # -------------------------------------------------------------------------
@@ -373,31 +376,42 @@ LOG_FIELDS = ["host_time", "event", "take", "motive_timecode", "motive_packet_id
 
 
 log_lock = threading.Lock()
+motive_session = {"name": ""}   # last SessionName from a CaptureStart packet
 
 
-def log_take(row: dict) -> None:
+def session_log_path(session_name: str) -> Path:
+    """takes_<session>.csv next to the script; spaces and characters Windows forbids
+    become '_' ("2026-11-20 Session" -> takes_2026-11-20_Session.csv)."""
+    if LOG_FIXED or not session_name:
+        return LOG_PATH
+    safe = re.sub(r'[\s<>:"/\\|?*\x00-\x1f]+', "_", session_name).strip("_.")
+    return HERE / f"takes_{safe}.csv" if safe else LOG_PATH
+
+
+def log_take(row: dict, path: Path | None = None) -> None:
     with log_lock:
-        _log_take(row)
+        _log_take(row, path or session_log_path(motive_session["name"]))
 
 
-def _log_take(row: dict) -> None:
-    if LOG_PATH.exists():
+def _log_take(row: dict, path: Path) -> None:
+    if path.exists():
         # Columns changed since the file was started: keep the old file, start a new one.
-        with LOG_PATH.open(encoding="utf-8") as f:
+        with path.open(encoding="utf-8") as f:
             header = f.readline().strip()
         if header and header != ",".join(LOG_FIELDS):
-            old = LOG_PATH.with_name(f"{LOG_PATH.stem}_{dt.datetime.now():%Y%m%d_%H%M%S}{LOG_PATH.suffix}")
-            LOG_PATH.rename(old)
+            old = path.with_name(f"{path.stem}_{dt.datetime.now():%Y%m%d_%H%M%S}{path.suffix}")
+            path.rename(old)
             print(f"[log] take log columns changed; old log kept as {old.name}")
-    new = not LOG_PATH.exists()
+    new = not path.exists()
     try:
-        with LOG_PATH.open("a", newline="", encoding="utf-8") as f:
+        with path.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
             if new:
                 w.writeheader()
+                print(f"[log] new take log {path.name}")
             w.writerow(row)
     except OSError as e:
-        print(f"[log] could not write {LOG_PATH}: {e}")
+        print(f"[log] could not write {path}: {e}")
 
 
 def status() -> None:
@@ -534,7 +548,8 @@ def listen():
     # On Windows a blocking recvfrom() never sees Ctrl+C; wake up regularly instead.
     sock.settimeout(0.5)
     print(f"Listening for Motive triggers on UDP {MOTIVE_PORT} -> {URL}")
-    print(f"Logging takes to {LOG_PATH}")
+    print(f"Logging takes to {LOG_PATH}" if LOG_FIXED else
+          f"Logging takes to {HERE}\\takes_<Motive session name>.csv")
     login()
     print(f"[camera] state: {rec_status()}")
     print_camera_info(camera_info(verbose=True))
@@ -580,6 +595,10 @@ def listen():
         take = fields.get("name", "")
         if kind == "start":
             current_take = take
+            # Only CaptureStart carries SessionName; the stop row goes to the same file.
+            if fields.get("sessionname"):
+                motive_session["name"] = fields["sessionname"]
+        log_path = session_log_path(motive_session["name"])
         take = take or current_take  # in case CaptureStop has no name
         tc = fields.get("timecode", "")
         print(f"[motive] {kind} take={take!r} tc={tc!r} from {addr[0]}")
@@ -594,14 +613,15 @@ def listen():
             extra["shotmark"] = f"skipped ({camera_format['value']})"
         elif kind == "start" and SHOT_MARK_AT_START and res["confirmed"]:
             # In the background, so a quick stop isn't held up by the delay.
-            def delayed_shotmark(take=take):
+            def delayed_shotmark(take=take, log_path=log_path):
                 time.sleep(SHOT_MARK_DELAY_S)
                 if rec_status() != "start":
                     print("[camera] shot mark skipped: no longer recording")
                     return
                 ok = post_mark(SHOTMARK_URL, "shot1mark", retries=1, wait_s=1.0)
                 log_take({"host_time": dt.datetime.now().isoformat(timespec="milliseconds"),
-                          "event": "shotmark", "take": take, "shotmark": "ok" if ok else "error"})
+                          "event": "shotmark", "take": take, "shotmark": "ok" if ok else "error"},
+                         log_path)
             threading.Thread(target=delayed_shotmark, daemon=True).start()
             extra["shotmark"] = f"in {SHOT_MARK_DELAY_S:g} s"
         info = camera_info()
@@ -610,7 +630,7 @@ def listen():
                      battery=info["battery"])
         log_take({"host_time": host_time, "event": kind, "take": take,
                   "motive_timecode": tc, "motive_packet_id": fields.get("packetid", ""),
-                  "motive_from": addr[0], **res, **extra})
+                  "motive_from": addr[0], **res, **extra}, log_path)
 
 
 if __name__ == "__main__":

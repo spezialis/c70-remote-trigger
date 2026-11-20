@@ -65,7 +65,7 @@ Everything after the REC press runs after it, so it doesn't delay recording.
 | `C70_IP` | `10.21.137.42` | Camera IP (optionally `ip:port`) |
 | `C70_USER` | `ias` | Browser Remote user |
 | `C70_PASSWORD` | – | Browser Remote password (required) |
-| `C70_LOG` | `takes.csv` next to the script | Take log file |
+| `C70_LOG` | `takes_<Motive session>.csv` next to the script | Fixed take log file instead of one per session |
 | `C70_SHOTMARK` | `1` | `0` = no shot mark at take start |
 | `C70_SHOTMARK_DELAY` | `1.5` | Seconds after REC start before the shot mark is sent |
 | `C70_TITLE` | `1` | `0` = don't write the take name as clip title |
@@ -73,7 +73,7 @@ Everything after the REC press runs after it, so it doesn't delay recording.
 
 ## Take log
 
-Every start and stop adds one row to `takes.csv`:
+Every start and stop adds one row to a CSV file **per Motive session**: `takes_<session name>.csv` next to the script, e.g. `takes_2026-11-20_Session.csv` for the session "2026-11-20 Session". The session name comes from Motive's start packet; spaces and characters that aren't allowed in file names become `_`. Rows written before the first take of a run (e.g. marks) go to `takes.csv`. Set `C70_LOG` to use one fixed file instead.
 
 | Column | Meaning |
 |---|---|
