@@ -48,11 +48,12 @@ PASSWORD = os.environ.get("C70_PASSWORD", "")  # set env var C70_PASSWORD
 START_BODY = {"action": "start"}
 STOP_BODY = {"action": "stop"}
 
-MOTIVE_PORT = 1512                 # Motive Command Port + 2
+MOTIVE_PORT = int(os.environ.get("C70_MOTIVE_PORT", "1512"))  # Motive Command Port + 2; tests use another port
 DEBOUNCE_S = 0.5                   # ignore duplicate packets within this window
 KEEPALIVE_S = 15                   # session seems to expire after ~45-60 s idle
 HERE = Path(__file__).resolve().parent
 LOG_PATH = Path(os.environ.get("C70_LOG", HERE / "takes.csv"))
+MOTIVE_RAW_LOG = HERE / "motive_packets.log"   # every raw UDP packet from Motive
 DISCOVER_DIR = HERE / "discover"
 # -------------------------------------------------------------------------
 
@@ -60,6 +61,24 @@ BASE = f"http://{CAMERA_IP}"
 LOGIN_URL = f"{BASE}/brapi/login"  # verified: Digest realm "BrowserRemote"
 LOGOUT_URL = f"{BASE}/brapi/logout"
 URL = f"{BASE}/ccapi/{API_VERSION}/shooting/control/recbutton"
+# From the camera's GET /ccapi list and shoot_script.js (2026-11-20, fw 1.1.4.1).
+# Paths and request bodies are copied from the web UI; not yet exercised by this script.
+SHOTMARK_URL = f"{BASE}/ccapi/{API_VERSION}/functions/shotmark"    # POST {"type":"shot1mark"}
+CLIPMARK_URL = f"{BASE}/ccapi/{API_VERSION}/functions/clipmark"    # POST {"type":"okmark"|"checkmark"}
+STORAGE_URL = f"{BASE}/ccapi/{API_VERSION}/devicestatus/storage"   # GET
+POWER_URL = f"{BASE}/ccapi/{API_VERSION}/devicestatus/powersource" # GET
+# From meta_script.js (2026-11-20): user memo = clip metadata (title etc.).
+MEMO_SETTING_URL = f"{BASE}/ccapi/{API_VERSION}/usermemo/setting"  # PUT {"value":"remote"} = "Activate"
+MEMO_DATA_URL = f"{BASE}/ccapi/{API_VERSION}/usermemo/data"        # PUT {"editclip":..., "clipmeta":{"title":...}}
+UIINFO_URL = f"{BASE}/brapi/metadata/uiinfo"                       # GET: uiinfo_usermemo.value, capability bits
+MEMO_CURRENT, MEMO_NEXT, MEMO_PREVIOUS = 1, 2, 4                   # capability bits -> editclip current/next/previous
+SHOT_MARK_AT_START = os.environ.get("C70_SHOTMARK", "1") != "0"
+# Verified 2026-11-20: the camera is busy for ~1 s after REC start, and every
+# rejected (503) shot mark shows an "invalid operation" pop-up on the camera.
+# So wait first instead of retrying fast.
+SHOT_MARK_DELAY_S = float(os.environ.get("C70_SHOTMARK_DELAY", "1.5"))
+CLIP_TITLE = os.environ.get("C70_TITLE", "1") != "0"               # write the Motive take name as clip title
+LOW_CARD_MIN = 10                  # warn below this many minutes of card time
 
 # Verified on device:
 # - /ccapi/* returns 403 {"message":"Not access"} without a session.
@@ -94,22 +113,25 @@ def login() -> bool:
 def logout() -> None:
     if "brsessionid" not in session.cookies:
         return
+    print("[camera] logging out ...", flush=True)
     try:
         session.get(LOGOUT_URL, timeout=2, allow_redirects=False)
         print("[camera] logged out")
     except requests.RequestException:
-        pass
+        print("[camera] logout failed (camera not reachable); the session expires in ~1 min")
+    except KeyboardInterrupt:
+        print("[camera] logout skipped; the session expires in ~1 min")
     session.cookies.clear()
 
 
-def _request(method: str, body: dict | None = None) -> requests.Response | None:
+def _request(method: str, body: dict | None = None, url: str = URL) -> requests.Response | None:
     kw = {"timeout": 2}
     if body is not None:
         kw["json"] = body
     with lock:
         for attempt in (1, 2):
             try:
-                r = session.request(method, URL, **kw)
+                r = session.request(method, url, **kw)
             except requests.RequestException as e:
                 print(f"[camera] request failed: {e}")
                 return None
@@ -130,6 +152,150 @@ def rec_status() -> str | None:
         return r.json()["recbutton"]["status"]
     except (ValueError, KeyError, TypeError):
         return None
+
+
+def _json(r: requests.Response | None) -> dict | None:
+    if r is None or not r.ok:
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+
+def _unwrap(obj: dict | None, key: str) -> dict:
+    """The web UI reads these as data.value[...]; accept the dict with or without that wrapper."""
+    if not isinstance(obj, dict):
+        return {}
+    if isinstance(obj.get("value"), dict):
+        obj = obj["value"]
+    return obj if key in obj else {}
+
+
+# Last recording format the camera reported ('xf-avc', 'mp4', ...).
+camera_format = {"value": ""}
+
+
+def marks_supported() -> bool:
+    """Observed 2026-11-20 (fw 1.1.4.1): in MP4 the camera rejects shot/clip marks
+    with 503 "Device busy" (+ "invalid operation" pop-up) and allows no clip title
+    (capability 0). In XF-AVC they work. Unknown format -> try anyway."""
+    return camera_format["value"] in ("", "xf-avc")
+
+
+def camera_info(verbose: bool = False) -> dict:
+    """Card time and battery, read-only. Field names come from shoot_script.js
+    (set_storage / set_powersource)."""
+    info = {"card": "", "card_min": "", "card_format": "", "power": "", "battery": ""}
+    st_raw = _json(_request("GET", url=STORAGE_URL))
+    pw_raw = _json(_request("GET", url=POWER_URL))
+    if verbose:
+        print(f"[camera] storage raw: {st_raw}")
+        print(f"[camera] powersource raw: {pw_raw}")
+    st = _unwrap(st_raw, "storageinfo")
+    for s in st.get("storageinfo", []):
+        if s.get("name") == st.get("currentstorage"):
+            info.update(card=s.get("name", ""), card_min=s.get("recordabletime", ""),
+                        card_format=s.get("recordingformat", ""))
+    if info["card_format"]:
+        camera_format["value"] = info["card_format"]
+    pw = _unwrap(pw_raw, "sourceinfo")
+    info["power"] = pw.get("currentsource", "")
+    for s in pw.get("sourceinfo", []):
+        if s.get("name") == info["power"]:
+            if info["power"] == "battery":
+                parts = [f"{s['level_percent']}%" if s.get("level_percent") not in (None, "") else "",
+                         f"{s['remaintime']} min" if s.get("remaintime") not in (None, "") else "",
+                         s.get("status", "")]
+                info["battery"] = " ".join(p for p in parts if p)
+            elif s.get("level_volt") not in (None, ""):
+                info["battery"] = f"DC {s['level_volt']} V"
+    return info
+
+
+def print_camera_info(info: dict) -> None:
+    print(f"[camera] card {info['card'] or '?'}: {info['card_min'] or '?'} min left, "
+          f"format {info['card_format'] or '?'} | power {info['power'] or '?'} {info['battery']}")
+    try:
+        if info["card_min"] != "" and int(info["card_min"]) < LOW_CARD_MIN:
+            print(f"[camera] WARNING: less than {LOW_CARD_MIN} min left on the card")
+    except (TypeError, ValueError):
+        pass
+
+
+def memo_info() -> tuple[str, int]:
+    """(usermemo setting 'remote'/'sdcard'/'', capability bits) from /brapi/metadata/uiinfo."""
+    j = _json(_request("GET", url=UIINFO_URL)) or {}
+    setting = (j.get("uiinfo_usermemo") or {}).get("value", "")
+    try:
+        cap = int(j.get("capability", 0)) if setting == "remote" else 0
+    except (TypeError, ValueError):
+        cap = 0
+    return setting, cap
+
+
+def memo_activate() -> bool:
+    """Same as the 'Activate' button on the Browser Remote metadata page."""
+    setting, _ = memo_info()
+    if setting == "remote":
+        print("[camera] metadata: remote (clip title can be set)")
+        return True
+    r = _request("PUT", {"value": "remote"}, url=MEMO_SETTING_URL)
+    ok = r is not None and r.ok
+    print(f"[camera] metadata was {setting or '?'!r}, activate remote -> "
+          f"{'OK' if ok else ('no response' if r is None else f'HTTP {r.status_code} {r.text.strip()[:200]}')}")
+    return ok
+
+
+def set_clip_title(title: str, editclip: str) -> bool:
+    """editclip: 'current' (clip being recorded), 'next' or 'previous'. XF-AVC only."""
+    r = _request("PUT", {"editclip": editclip, "clipmeta": {"title": title}}, url=MEMO_DATA_URL)
+    ok = r is not None and r.ok
+    detail = "no response" if r is None else f"HTTP {r.status_code} {r.text.strip()[:200]}"
+    print(f"[camera] clip title {title!r} -> {editclip} clip: {detail}")
+    return ok
+
+
+def title_after(kind: str, take: str, pending: dict) -> str:
+    """Write the take name as clip title. Called after REC was pressed.
+
+    At start: the current clip if the camera allows it (capability bit 1).
+    Otherwise it's remembered and written to the previous clip after stop (bit 4).
+    Returns what to log in the clip_title column.
+    """
+    if not (CLIP_TITLE and take):
+        return ""
+    if not marks_supported():
+        return f"skipped ({camera_format['value']})"
+    _, cap = memo_info()
+    if kind == "start":
+        if cap & MEMO_CURRENT:
+            pending.pop("title", None)
+            return "current" if set_clip_title(take, "current") else "error"
+        pending["title"] = take
+        return f"pending (cap={cap})"
+    title = pending.pop("title", None)
+    if title is None:
+        return ""
+    if cap & MEMO_PREVIOUS:
+        return "previous" if set_clip_title(title, "previous") else "error"
+    print(f"[camera] clip title not set: camera doesn't allow it (capability={cap}; "
+          f"needs XF-AVC and metadata = remote)")
+    return f"unavailable (cap={cap})"
+
+
+def post_mark(url: str, kind: str, retries: int = 0, wait_s: float = 0.5) -> bool:
+    """POST a shot/clip mark. Verified 2026-11-20: right after REC start the camera
+    answers 503 {"message":"Device busy"}, so the shot mark retries on 503."""
+    for attempt in range(retries + 1):
+        r = _request("POST", {"type": kind}, url=url)
+        ok = r is not None and r.ok
+        detail = "no response" if r is None else f"HTTP {r.status_code} {r.text.strip()[:200]}"
+        print(f"[camera] {kind} -> {detail}" + (f" (try {attempt + 1})" if retries else ""))
+        if ok or r is None or r.status_code != 503:
+            return ok
+        time.sleep(wait_s)
+    return False
 
 
 def press_rec(body: dict, t0: float | None = None) -> dict:
@@ -164,29 +330,65 @@ def press_rec(body: dict, t0: float | None = None) -> dict:
 
 
 # ------------------------------------------------------------ Motive packets
+FIELD_RE = re.compile(r"<(\w+)\s+VALUE\s*=\s*\"([^\"]*)\"", re.I)
+
+
 def parse_motive(msg: str) -> tuple[str, dict] | None:
-    """Return (root tag, {child tag: VALUE attr}) for Motive's XML broadcast.
+    """Return (root tag, {child tag lowercased: VALUE attr}) for Motive's XML broadcast.
 
     Field names (Name, TimeCode, ...) follow OptiTrack's documentation and are
-    not yet verified on this Motive install; the raw XML is printed so they can
-    be checked. Falls back to substring matching if the XML doesn't parse.
+    not yet verified on this Motive install; every raw packet is appended to
+    MOTIVE_RAW_LOG so they can be checked. Keys are lowercased so the lookup
+    doesn't depend on capitalisation. Motive may pad the packet with NUL bytes,
+    which break the XML parser; they are stripped, and if parsing still fails,
+    the fields are pulled out with a regex.
     """
+    clean = msg.replace("\x00", "").strip().lstrip("﻿")
     try:
-        root = ET.fromstring(msg.strip().lstrip("﻿"))
+        root = ET.fromstring(clean)
+        fields = {}
+        for child in root:
+            attrs = {k.lower(): v for k, v in child.attrib.items()}
+            fields[child.tag.lower()] = attrs.get("value", (child.text or "").strip())
+        return root.tag, fields
     except ET.ParseError:
         for tag in ("CaptureStart", "CaptureStop"):
-            if tag in msg:
-                return tag, {}
+            if tag in clean:
+                return tag, {k.lower(): v for k, v in FIELD_RE.findall(clean)}
         return None
-    fields = {child.tag: child.get("VALUE", (child.text or "").strip()) for child in root}
-    return root.tag, fields
+
+
+def log_raw(data: bytes, addr) -> None:
+    """Append one raw Motive packet (repr, so NULs/BOMs are visible) for debugging."""
+    try:
+        with MOTIVE_RAW_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now().isoformat(timespec='milliseconds')} {addr[0]} {data!r}\n")
+    except OSError as e:
+        print(f"[log] could not write {MOTIVE_RAW_LOG}: {e}")
 
 
 LOG_FIELDS = ["host_time", "event", "take", "motive_timecode", "motive_packet_id",
-              "motive_from", "post_http", "post_ms", "state", "confirmed", "confirm_ms"]
+              "motive_from", "post_http", "post_ms", "state", "confirmed", "confirm_ms",
+              "shotmark", "clip_title", "card_min", "card_format", "battery"]
+
+
+log_lock = threading.Lock()
 
 
 def log_take(row: dict) -> None:
+    with log_lock:
+        _log_take(row)
+
+
+def _log_take(row: dict) -> None:
+    if LOG_PATH.exists():
+        # Columns changed since the file was started: keep the old file, start a new one.
+        with LOG_PATH.open(encoding="utf-8") as f:
+            header = f.readline().strip()
+        if header and header != ",".join(LOG_FIELDS):
+            old = LOG_PATH.with_name(f"{LOG_PATH.stem}_{dt.datetime.now():%Y%m%d_%H%M%S}{LOG_PATH.suffix}")
+            LOG_PATH.rename(old)
+            print(f"[log] take log columns changed; old log kept as {old.name}")
     new = not LOG_PATH.exists()
     try:
         with LOG_PATH.open("a", newline="", encoding="utf-8") as f:
@@ -234,7 +436,11 @@ def discover(max_files: int = 60) -> None:
     if not login():
         return
     host = urlparse(BASE).netloc
-    queue, seen = ["/wpd/shoot.shtml"], set()
+    # meta.shtml = metadata page (user memo); it's only linked from script code.
+    queue, seen = ["/wpd/shoot.shtml", "/wpd/meta.shtml"], set()
+    # Links inside a script are relative to the page that loaded it, not to the
+    # script's own folder (/wpd/js/meta.shtml -> 500, /wpd/meta.shtml is right).
+    page_of: dict[str, str] = {}
     endpoints: dict[str, set[str]] = {}
     funcs: dict[str, set[str]] = {}
     DISCOVER_DIR.mkdir(exist_ok=True)
@@ -259,9 +465,11 @@ def discover(max_files: int = 60) -> None:
             endpoints.setdefault(m.rstrip("/."), set()).add(path)
         for m in FUNC_RE.findall(text):
             funcs.setdefault(m, set()).add(path)
+        page = page_of.get(path, path) if path.endswith(".js") else path
         for link in LINK_RE.findall(text):
-            u = urlparse(urljoin(BASE + path, link))
+            u = urlparse(urljoin(BASE + page, link))
             if u.netloc == host and u.path not in seen:
+                page_of.setdefault(u.path, page)
                 queue.append(u.path)
 
     # Standard CCAPI exposes its endpoint list at GET /ccapi; may not exist on the C70.
@@ -289,22 +497,70 @@ def keepalive() -> None:
             print("[camera] keepalive failed")
 
 
+KEYS_HELP = "Keys (type + Enter): o = OK mark, c = check mark, i = card/battery info"
+
+
+def keyboard(state: dict) -> None:
+    """Clip marks / info from the bridge terminal: the camera allows only one
+    session, so these can't come from a second process while the bridge runs."""
+    while True:
+        try:
+            line = input().strip().lower()
+        except (EOFError, OSError):
+            return  # no console (e.g. started in the background)
+        if line in ("o", "ok", "c", "check") and not marks_supported():
+            print(f"[camera] clip marks need XF-AVC; camera records {camera_format['value']}")
+            continue
+        if line in ("o", "ok"):
+            ok = post_mark(CLIPMARK_URL, "okmark")
+        elif line in ("c", "check"):
+            ok = post_mark(CLIPMARK_URL, "checkmark")
+        elif line in ("i", "info"):
+            print_camera_info(camera_info())
+            continue
+        else:
+            if line:
+                print(KEYS_HELP)
+            continue
+        log_take({"host_time": dt.datetime.now().isoformat(timespec="milliseconds"),
+                  "event": "okmark" if line.startswith("o") else "checkmark",
+                  "take": state["take"], "post_http": "ok" if ok else "error"})
+
+
 def listen():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("", MOTIVE_PORT))
+    # On Windows a blocking recvfrom() never sees Ctrl+C; wake up regularly instead.
+    sock.settimeout(0.5)
     print(f"Listening for Motive triggers on UDP {MOTIVE_PORT} -> {URL}")
     print(f"Logging takes to {LOG_PATH}")
     login()
     print(f"[camera] state: {rec_status()}")
+    print_camera_info(camera_info(verbose=True))
+    if not marks_supported():
+        print(f"[camera] records {camera_format['value']}: shot mark, OK/check marks and clip title "
+              f"are skipped (XF-AVC only)")
+    print(f"Shot mark at take start: {'on' if SHOT_MARK_AT_START else 'off'} (C70_SHOTMARK=0 turns it off)")
+    print(f"Clip title = take name: {'on' if CLIP_TITLE else 'off'} (C70_TITLE=0 turns it off)")
+    if CLIP_TITLE:
+        memo_activate()
+    pending: dict = {}
+    print(KEYS_HELP)
     threading.Thread(target=keepalive, daemon=True).start()
+    state = {"take": ""}
+    threading.Thread(target=keyboard, args=(state,), daemon=True).start()
 
     last = {"start": 0.0, "stop": 0.0}
     current_take = ""
     while True:
-        data, addr = sock.recvfrom(65535)
+        try:
+            data, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
         t_rx = time.perf_counter()
         host_time = dt.datetime.now().isoformat(timespec="milliseconds")
+        log_raw(data, addr)
         msg = data.decode("utf-8", errors="ignore")
         parsed = parse_motive(msg)
         if parsed is None:
@@ -321,17 +577,40 @@ def listen():
             continue
         last[kind] = now
 
-        take = fields.get("Name", "")
+        take = fields.get("name", "")
         if kind == "start":
             current_take = take
         take = take or current_take  # in case CaptureStop has no name
-        tc = fields.get("TimeCode", "")
+        tc = fields.get("timecode", "")
         print(f"[motive] {kind} take={take!r} tc={tc!r} from {addr[0]}")
-        print(f"[motive] raw: {msg.strip()[:500]}")
+        print(f"[motive] fields: {fields}")
+        state["take"] = take
         res = press_rec(body, t_rx)
+        # Everything below runs after REC was pressed, so it can't delay it.
+        extra = {}
+        if res["confirmed"]:
+            extra["clip_title"] = title_after(kind, take, pending)
+        if kind == "start" and SHOT_MARK_AT_START and res["confirmed"] and not marks_supported():
+            extra["shotmark"] = f"skipped ({camera_format['value']})"
+        elif kind == "start" and SHOT_MARK_AT_START and res["confirmed"]:
+            # In the background, so a quick stop isn't held up by the delay.
+            def delayed_shotmark(take=take):
+                time.sleep(SHOT_MARK_DELAY_S)
+                if rec_status() != "start":
+                    print("[camera] shot mark skipped: no longer recording")
+                    return
+                ok = post_mark(SHOTMARK_URL, "shot1mark", retries=1, wait_s=1.0)
+                log_take({"host_time": dt.datetime.now().isoformat(timespec="milliseconds"),
+                          "event": "shotmark", "take": take, "shotmark": "ok" if ok else "error"})
+            threading.Thread(target=delayed_shotmark, daemon=True).start()
+            extra["shotmark"] = f"in {SHOT_MARK_DELAY_S:g} s"
+        info = camera_info()
+        print_camera_info(info)
+        extra.update(card_min=info["card_min"], card_format=info["card_format"],
+                     battery=info["battery"])
         log_take({"host_time": host_time, "event": kind, "take": take,
-                  "motive_timecode": tc, "motive_packet_id": fields.get("PacketID", ""),
-                  "motive_from": addr[0], **res})
+                  "motive_timecode": tc, "motive_packet_id": fields.get("packetid", ""),
+                  "motive_from": addr[0], **res, **extra})
 
 
 if __name__ == "__main__":
@@ -341,10 +620,14 @@ if __name__ == "__main__":
     p.add_argument("--discover", action="store_true",
                    help="crawl the Browser Remote UI (GET only), list API paths, save to ./discover")
     p.add_argument("--get", metavar="PATH", help="login + read-only GET of PATH, e.g. /ccapi")
+    p.add_argument("--info", action="store_true", help="login + card time and battery (read-only)")
     a = p.parse_args()
     atexit.register(logout)  # free the single camera session (also on Ctrl+C)
     if a.discover:
         discover()
+    elif a.info:
+        if login():
+            print_camera_info(camera_info(verbose=True))
     elif a.get:
         if login():
             get_path(a.get)
@@ -355,4 +638,7 @@ if __name__ == "__main__":
         login()
         press_rec(START_BODY if a.test == "start" else STOP_BODY)
     else:
-        listen()
+        try:
+            listen()
+        except KeyboardInterrupt:
+            print("\nStopping (Ctrl+C)")

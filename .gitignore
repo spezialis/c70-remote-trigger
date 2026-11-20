@@ -4,3 +4,6 @@ video_test/
 takes.csv
 discover/
 CAC70RF.pdf
+motive_packets.log
+video_mocap_test/
+takes_*.csv
