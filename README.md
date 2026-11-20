@@ -26,23 +26,53 @@ A single Python script runs on the Motive PC. It listens for Motive's remote-tri
 
 The camera allows **one Browser Remote session per user**. While the bridge is running, logging in to Browser Remote in a web browser with the same user is refused, and the other way round. A stale session expires after about a minute.
 
-## Usage
+## Starting the bridge
 
-Set the camera credentials as environment variables (PowerShell):
+On the Motive PC, every time you open a new terminal:
 
-```powershell
-$env:C70_IP = "192.168.1.10"        # camera IP
-$env:C70_USER = "<user>"
-$env:C70_PASSWORD = "<password>"
-```
+1. **Open a terminal in the project folder.** In VS Code: **Terminal → New Terminal** (Ctrl+`).
+
+2. **Set the camera's IP address.** The camera gets it by DHCP, so it can change. Check it on the camera under the network settings.
+   ```powershell
+   $env:C70_IP = "10.21.137.75"
+   ```
+
+3. **Enter the password.** This asks for it without showing it or saving it in the shell history:
+   ```powershell
+   $env:C70_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host "C70 password" -AsSecureString)))
+   ```
+   The user defaults to `ias`; set `$env:C70_USER` for another one.
+
+4. **Optional: check the connection.** It logs in, prints the REC state, and logs out again.
+   ```powershell
+   python c70_motive_bridge.py --status
+   ```
+
+5. **Start the bridge.**
+   ```powershell
+   python c70_motive_bridge.py
+   ```
+   It prints the camera's card, format and power, then `Listening for Motive triggers ...`. Leave the terminal open and record in Motive.
+
+6. **Stop it** with **Ctrl+C**, once. It logs out of the camera (`[camera] logged out`), so you can use Browser Remote in a browser again right away.
+
+The IP and password only last for that terminal. In a new terminal, repeat steps 2 and 3.
+
+If the login is refused with `another session is active`, close any Browser Remote tab or wait about a minute. This also happens after the bridge was closed without Ctrl+C.
+
+### Other commands
 
 ```powershell
 python c70_motive_bridge.py --status       # log in and read the REC state (doesn't record)
-python c70_motive_bridge.py --info         # card time left and battery (read-only)
+python c70_motive_bridge.py --info         # card time left, format and power (read-only)
 python c70_motive_bridge.py --test start   # press REC once
 python c70_motive_bridge.py --test stop
-python c70_motive_bridge.py                # run the bridge; Ctrl+C stops it and logs out
+python c70_motive_bridge.py --discover     # download the Browser Remote web UI (read-only)
 ```
+
+These log in too, so stop the bridge before running them.
+
+### What the bridge does
 
 While running, the bridge:
 - logs in at startup and keeps the session alive every 15 s
